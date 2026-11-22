@@ -1,0 +1,29 @@
+# Filled in by ../prod: PIPELINE, PROD_DIR, FAIRSHIP, SCRIPT, GEO, MODE, MODE_OPT, BATCH, JOBLIST (lines: sim,out)
+executable = $(PIPELINE)/cavern.sh
+arguments  = "$(FAIRSHIP) $(SCRIPT) $(sim) $(GEO) $(out) $(MODE_OPT)"
+
+initialdir = $(PROD_DIR)/logs/$(MODE)
+output     = $(MODE)_$(Cluster)_$(Process).out
+error      = $(MODE)_$(Cluster)_$(Process).err
+log        = $(MODE)_$(Cluster).log
+batch_name = $(BATCH)
+
+notify_user  = jasmin.weiss@student.hu-berlin.de
+notification = Error
+
+# 250k events per sim file (~170 MB), truth only: ~10 min in the test (20k events < 1 min)
+request_CPUs   = 1
+request_memory = 2 GB
+request_disk   = 1 GB
+
++JobFlavour = "longlunch"
+
+on_exit_remove = (ExitBySignal == False) && (ExitCode == 0)
+max_retries    = 3
+requirements   = (OpSysAndVer =?= "AlmaLinux9") && (Machine =!= LastRemoteHost)
++REQUIRED_OS   = "AlmaLinux9"
+
+# caps how many jobs run at once, so the AFS-hosted FairShip workspace is not hit by all jobs simultaneously
+max_materialize = 200
+
+queue sim,out from $(JOBLIST)

@@ -1,0 +1,200 @@
+#!/bin/bash
+# Single entry point for the new muon background samples (cuda-propagated muons, sim only), see README.md.
+#   ./prod status                            overview of all productions
+#   ./prod <production> check                FairShip worktree, geo file, input files ok?
+#   ./prod <production> cavern short|full    truth cavern histograms, one job per sim file without output yet (short: 5)
+#   ./prod <production> plot                 hadd the job outputs and draw the plots (runs here, not on condor)
+# Add --pdg to cavern and plot for the mu+/mu- mode (wall vertex x, theta_xz at station 1).
+# Add --dry-run to cavern to see what would be submitted, without submitting.
+set -euo pipefail
+shopt -s nullglob
+
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+PIPELINE=$ROOT/pipeline
+SCRIPT=$ROOT/analysis/cavern_truth.py
+SHORT_JOBS=5
+PIXI_BIN=/cvmfs/ship-nightlies.cern.ch/pixi/0.72.0-rattlerfs-layers-d5a7568/bin
+
+DRY_RUN=false
+PDG=false
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+usage() { sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+productions() { local c; for c in "$ROOT"/*/config.sh; do basename "$(dirname "$c")"; done; }
+
+load_config() {
+    NAME=$1
+    PROD_DIR=$ROOT/$NAME
+    [ -f "$PROD_DIR/config.sh" ] || die "unknown production '$NAME', available: $(productions | tr '\n' ' ')"
+    # shellcheck source=/dev/null
+    source "$PROD_DIR/config.sh"
+    set_mode
+}
+set_mode() {  # MODE = cavern | cavern_pdg, decides output folder, batch name and script option
+    if [ "$PDG" = true ]; then MODE=cavern_pdg; MODE_OPT=--pdg; else MODE=cavern; MODE_OPT=; fi
+    BATCH=newMuonBack_${NAME}_$MODE
+    OUT_BASE=$EOS_BASE/$MODE
+}
+
+inputs() { local f; for f in "$INPUT_DIR"/sim_*.root; do echo "$f"; done; }
+hist_of() { echo "$OUT_BASE/hists/$(basename "$1")"; }   # job output: same name as the sim file
+queued() {  # [batch] jobs in the queue; condor_q fails now and then, so retry
+    local batch=${1:-$BATCH} out try
+    for try in 1 2 3; do
+        if out=$(condor_q -constraint "JobBatchName == \"$batch\"" -af ProcId 2> /dev/null); then
+            [ -z "$out" ] && echo 0 || wc -l <<< "$out"
+            return
+        fi
+        sleep 2
+    done
+    echo "?"
+}
+missing_count() { local f m=0; while read -r f; do [ -f "$(hist_of "$f")" ] || m=$((m + 1)); done < <(inputs); echo "$m"; }
+
+ok()  { printf '  ok    %s\n' "$1"; }
+bad() { printf '  FAIL  %s\n' "$1"; CHECK_FAILED=true; }
+
+# FairShip is only used as environment (ROOT + FairShip classes to read MCTrack etc.), so no build checks
+check() {
+    CHECK_FAILED=false
+    if git -C "$FAIRSHIP" rev-parse --git-dir > /dev/null 2>&1; then
+        local current
+        current=$(git -C "$FAIRSHIP" branch --show-current)
+        if [ "$current" = "$BRANCH" ]; then ok "$FAIRSHIP on branch $BRANCH"; else bad "$FAIRSHIP is on branch '$current', config.sh wants '$BRANCH'"; fi
+    else
+        bad "$FAIRSHIP is not a git worktree"
+    fi
+    if [ -f "$GEO" ]; then ok "geo file $(basename "$GEO")"; else bad "geo file missing: $GEO"; fi
+    if [ -f "$SCRIPT" ]; then ok "script $(basename "$SCRIPT")"; else bad "script missing: $SCRIPT"; fi
+    local n
+    n=$(inputs | wc -l)
+    if [ "$n" -gt 0 ]; then ok "$n sim files in $INPUT_DIR"; else bad "no sim_*.root in $INPUT_DIR"; fi
+    [ "$CHECK_FAILED" = false ]
+}
+require_ready() {
+    check > /dev/null || { check || true; die "$NAME is not ready, nothing was submitted"; }
+}
+
+cmd_cavern() {
+    local mode=${1:-} limit
+    case $mode in
+        short) limit=$SHORT_JOBS ;;
+        full) limit=999999999 ;;
+        *) die "choose short ($SHORT_JOBS jobs) or full" ;;
+    esac
+    require_ready
+    local active
+    active=$(queued)
+    [ "$active" != "?" ] || die "condor_q failed 3 times, cannot tell whether jobs of $BATCH are still running, try again"
+    [ "$active" -eq 0 ] || die "$active jobs of $BATCH are still in the queue, wait until they are done"
+
+    mkdir -p "$PROD_DIR/logs/$MODE"
+    local joblist=$PROD_DIR/logs/$MODE/joblist_$(date +%Y%m%d_%H%M%S).txt total=0 done=0 n=0 f
+    : > "$joblist"
+    while read -r f; do
+        total=$((total + 1))
+        if [ -f "$(hist_of "$f")" ]; then done=$((done + 1)); continue; fi
+        [ "$n" -lt "$limit" ] || continue
+        echo "$f,$(hist_of "$f")" >> "$joblist"
+        n=$((n + 1))
+    done < <(inputs)
+    echo "$NAME ($MODE): $total sim files, $done already done, submitting $n ($mode)"
+    [ "$n" -gt 0 ] || { rm -f "$joblist"; return; }
+
+    local vars=(PIPELINE="$PIPELINE" PROD_DIR="$PROD_DIR" FAIRSHIP="$FAIRSHIP" SCRIPT="$SCRIPT" GEO="$GEO"
+        MODE="$MODE" MODE_OPT="$MODE_OPT" BATCH="$BATCH" JOBLIST="$joblist")
+    if [ "$DRY_RUN" = true ]; then
+        echo "--- dry run, first jobs:"
+        head -3 "$joblist"
+        condor_submit -dry-run - "$PIPELINE/cavern.sub" "${vars[@]}" 2> /dev/null \
+            | grep -E '^(Arguments|Cmd|Iwd|JobFlavour|RequestMemory|TotalSubmitProcs) ?=' | sort -u | head -10 || true
+        rm -f "$joblist"
+        return
+    fi
+
+    mkdir -p "$OUT_BASE/hists"
+    local output cluster
+    output=$(condor_submit "$PIPELINE/cavern.sub" "${vars[@]}") || { echo "$output"; die "condor_submit failed"; }
+    echo "$output"
+    cluster=$(grep -oP 'submitted to cluster \K[0-9]+' <<< "$output")
+    printf '%s  %-10s cluster=%-9s mode=%s jobs=%s  branch=%s commit=%s script=%s\n' "$(date '+%F %T')" "$MODE" "$cluster" "$mode" "$n" \
+        "$BRANCH" "$(git -C "$FAIRSHIP" rev-parse --short HEAD)" "$(md5sum < "$SCRIPT" | cut -c1-8)" >> "$PROD_DIR/submissions.log"
+    echo "Output: $OUT_BASE/hists   Progress: ./prod status   Then: ./prod $NAME plot${MODE_OPT:+ $MODE_OPT}"
+}
+
+cmd_plot() {
+    [ -f "$SCRIPT" ] || die "script missing: $SCRIPT"
+    local active
+    active=$(queued)
+    [ "$active" != "?" ] || die "condor_q failed 3 times, try again"
+    [ "$active" -eq 0 ] || die "$active jobs of $BATCH are still in the queue, wait until they are done"
+
+    local hists=("$OUT_BASE"/hists/*.root) total missing
+    [ "${#hists[@]}" -gt 0 ] || die "no job output in $OUT_BASE/hists, run ./prod $NAME cavern${MODE_OPT:+ $MODE_OPT} first"
+    total=$(inputs | wc -l)
+    missing=$((total - ${#hists[@]}))
+    [ "$missing" -le 0 ] || echo "WARNING: $missing of $total sim files have no output, the plots are made without them"
+
+    export PATH=$PIXI_BIN:$PATH
+    local merged=$OUT_BASE/merged.root plots=$OUT_BASE/plots
+    echo "$NAME ($MODE): hadd of ${#hists[@]} files -> $merged"
+    pixi cvmfs "$FAIRSHIP" hadd -f -k "$merged" "${hists[@]}" > "$PROD_DIR/logs/hadd_$MODE.log" 2>&1 \
+        || { tail -20 "$PROD_DIR/logs/hadd_$MODE.log"; die "hadd failed, see logs/hadd_$MODE.log"; }
+    pixi cvmfs "$FAIRSHIP" python "$SCRIPT" --plot "$merged" --outdir "$plots" --tag "${NAME}_" $MODE_OPT \
+        ${SUMW_TOT:+--sumw-tot "$SUMW_TOT"}
+    printf '%s  %-10s plot files=%s/%s  -> %s\n' "$(date '+%F %T')" "$MODE" "${#hists[@]}" "$total" "$plots" >> "$PROD_DIR/submissions.log"
+    echo "Plots: $plots"
+}
+
+failed_logs() {  # <mode> <cluster>: finished logs of that cluster without SUCCESS
+    grep -L SUCCESS "$PROD_DIR/logs/$1/$1_$2"_*.out 2> /dev/null | wc -l || true
+}
+
+cmd_status() {
+    local name m total missing last cluster failed
+    for name in $(productions); do
+        PDG=false; load_config "$name"
+        if check > /dev/null 2>&1; then echo "$name  ($BRANCH @ $(git -C "$FAIRSHIP" rev-parse --short HEAD 2> /dev/null || echo ?))  ready"
+        else echo "$name  NOT READY -> ./prod $name check"; fi
+        total=$(inputs | wc -l)
+        for m in false true; do
+            PDG=$m; set_mode
+            missing=$(missing_count)
+            printf '    %-10s %s/%s files, %s jobs in the queue%s\n' "$MODE" "$((total - missing))" "$total" "$(queued)" \
+                "$([ -f "$OUT_BASE/merged.root" ] && echo ", plots in $OUT_BASE/plots")"
+            last=$(grep -E "^\S+ \S+  $MODE +cluster" "$PROD_DIR/submissions.log" 2> /dev/null | tail -1 || true)
+            [ -n "$last" ] || continue
+            echo "      last: $last"
+            cluster=$(grep -oP 'cluster=\K[0-9]+' <<< "$last")
+            failed=$(failed_logs "$MODE" "$cluster")
+            [ "$failed" -eq 0 ] || echo "      $failed finished logs without SUCCESS: grep -L SUCCESS $name/logs/$MODE/${MODE}_${cluster}_*.out"
+        done
+    done
+}
+
+args=()
+for arg in "$@"; do
+    case $arg in
+        --dry-run) DRY_RUN=true ;;
+        --pdg) PDG=true ;;
+        *) args+=("$arg") ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
+[ $# -ge 1 ] || usage
+if [ "$1" = status ]; then
+    cmd_status
+    exit 0
+fi
+[ $# -ge 2 ] || usage
+
+load_config "$1"
+step=$2
+shift 2
+case $step in
+    check) echo "$NAME: $FAIRSHIP"; check ;;
+    cavern) cmd_cavern "$@" ;;
+    plot) cmd_plot ;;
+    *) usage ;;
+esac
